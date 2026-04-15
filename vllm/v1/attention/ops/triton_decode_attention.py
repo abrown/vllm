@@ -36,6 +36,7 @@ from packaging import version
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 
 is_hip_ = current_platform.is_rocm()
 
@@ -65,16 +66,10 @@ def _fwd_kernel_stage1(
     Req_to_tokens,
     B_Seqlen,
     Att_Out,
-    stride_req_to_tokens_b,
-    stride_qbs,
-    stride_qh,
-    stride_buf_kbs,
-    stride_buf_kh,
-    stride_buf_vbs,
-    stride_buf_vh,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
+    req_to_tokens_stride,
+    num_q_heads,
+    num_kv_heads,
+    kv_total_tokens,
     k_scale,
     v_scale,
     kv_group_num: tl.constexpr,
@@ -93,15 +88,17 @@ def _fwd_kernel_stage1(
 
     cur_kv_head = cur_head // kv_group_num
 
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    mask_d = offs_d < Lk
-    mask_dv = offs_dv < Lv
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = cur_batch
 
-    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
-    q = tl.load(Q + off_q, mask=mask_d, other=0.0)
+    # Load Q via TMA descriptor: 2D view (1, Lk) for this batch+head.
+    desc_q = tl.make_tensor_descriptor(
+        Q + cur_batch * num_q_heads * Lk + cur_head * Lk,
+        shape=[1, Lk],
+        strides=[Lk, 1],
+        block_shape=[1, BLOCK_DMODEL],
+    )
+    q = desc_q.load([0, 0])  # shape (1, BLOCK_DMODEL); zero-padded if Lk < BLOCK_DMODEL
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
@@ -112,31 +109,41 @@ def _fwd_kernel_stage1(
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
+        # K descriptor: 2D view (kv_total_tokens, Lk) for cur_kv_head.
+        # Base pointer selects the head; stride[0] skips all heads per token.
+        desc_k = tl.make_tensor_descriptor(
+            K_Buffer + cur_kv_head * Lk,
+            shape=[kv_total_tokens, Lk],
+            strides=[num_kv_heads * Lk, 1],
+            block_shape=[1, BLOCK_DMODEL],
+        )
+        # V descriptor: 2D view (kv_total_tokens, Lv) for cur_kv_head.
+        desc_v = tl.make_tensor_descriptor(
+            V_Buffer + cur_kv_head * Lv,
+            shape=[kv_total_tokens, Lv],
+            strides=[num_kv_heads * Lv, 1],
+            block_shape=[1, BLOCK_DV],
+        )
+
         ks = tl.load(k_scale)
         vs = tl.load(v_scale)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_page_number = tl.load(
                 Req_to_tokens
-                + stride_req_to_tokens_b * cur_batch_req_idx
+                + req_to_tokens_stride * cur_batch_req_idx
                 + offs_n // PAGE_SIZE,
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
-            offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
-            )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
-                other=0.0,
-            )
+            kv_loc = (kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE).to(tl.int32)
+
+            # Gather K rows by token index; result is (BLOCK_N, BLOCK_DMODEL).
+            k = desc_k.gather(kv_loc, 0)
             if k.dtype.is_fp8():
                 k = (k.to(tl.float32) * ks).to(q.dtype)
-            qk = tl.sum(q[None, :] * k, 1)
+            # q is (1, BLOCK_DMODEL) — broadcasts over BLOCK_N rows of k.
+            qk = tl.sum(q * k, 1)
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -144,16 +151,8 @@ def _fwd_kernel_stage1(
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                other=0.0,
-            )
+            # Gather V rows by token index; result is (BLOCK_N, BLOCK_DV).
+            v = desc_v.gather(kv_loc, 0)
             if v.dtype.is_fp8():
                 v = (v.to(tl.float32) * vs).to(q.dtype)
 
@@ -166,10 +165,19 @@ def _fwd_kernel_stage1(
             e_sum = e_sum * re_scale + tl.sum(p, 0)
             e_max = n_e_max
 
+        # Att_Out shape is (B, num_q_heads, NUM_KV_SPLITS, Lv + 1).
+        # Compute strides from dimensions (contiguous layout).
+        att_mid_os = Lv + 1
+        att_mid_oh = NUM_KV_SPLITS * att_mid_os
+        att_mid_ob = num_q_heads * att_mid_oh
+
+        offs_dv = tl.arange(0, BLOCK_DV)
+        mask_dv = offs_dv < Lv
+
         offs_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            cur_batch * att_mid_ob
+            + cur_head * att_mid_oh
+            + split_kv_id * att_mid_os
             + offs_dv
         )
 
@@ -180,9 +188,9 @@ def _fwd_kernel_stage1(
         )
 
         offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            cur_batch * att_mid_ob
+            + cur_head * att_mid_oh
+            + split_kv_id * att_mid_os
             + Lv
         )
 
@@ -213,9 +221,11 @@ def _decode_att_m_fwd(
     Lv = v_buffer.shape[-1]
 
     batch, head_num = q.shape[0], q.shape[1]
+    num_kv_heads = k_buffer.shape[-2]
+    kv_total_tokens = k_buffer.numel() // (num_kv_heads * Lk)
 
     grid = (batch, head_num, NUM_KV_SPLITS)
-    kv_group_num = q.shape[1] // k_buffer.shape[-2]
+    kv_group_num = q.shape[1] // num_kv_heads
 
     num_warps = 4
     if kv_group_num != 1:
@@ -233,15 +243,9 @@ def _decode_att_m_fwd(
         B_Seqlen,
         att_out,
         Req_to_tokens.stride(0),
-        q.stride(0),
-        q.stride(1),
-        k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        att_out.stride(0),
-        att_out.stride(1),
-        att_out.stride(2),
+        head_num,
+        num_kv_heads,
+        kv_total_tokens,
         k_scale,
         v_scale,
         kv_group_num=kv_group_num,
@@ -267,16 +271,10 @@ def _fwd_grouped_kernel_stage1(
     Req_to_tokens,
     B_Seqlen,
     Att_Out,
-    stride_req_to_tokens_b,
-    stride_qbs,
-    stride_qh,
-    stride_buf_kbs,
-    stride_buf_kh,
-    stride_buf_vbs,
-    stride_buf_vh,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
+    req_to_tokens_stride,
+    num_q_heads,
+    num_kv_heads,
+    kv_total_tokens,
     k_scale,
     v_scale,
     kv_group_num: tl.constexpr,
@@ -303,33 +301,27 @@ def _fwd_grouped_kernel_stage1(
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
     mask_h = mask_h & (cur_head < q_head_num)
 
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
-    mask_d = offs_d < Lk
-    mask_dv = offs_dv < Lv
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = cur_batch
 
-    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
-    q = tl.load(
-        Q + offs_q,
-        mask=(mask_h[:, None]) & (mask_d[None, :]),
-        other=0.0,
-        cache_modifier=".ca",
+    # Load Q tile via TMA descriptor: (BLOCK_H, BLOCK_DMODEL).
+    cur_head_start = cur_head_id * VALID_BLOCK_H
+    desc_q = tl.make_tensor_descriptor(
+        Q + cur_batch * num_q_heads * Lk,
+        shape=[q_head_num, Lk],
+        strides=[Lk, 1],
+        block_shape=[BLOCK_H, BLOCK_DMODEL],
     )
+    q = desc_q.load([cur_head_start, 0])
 
     if BLOCK_DPE > 0:
-        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        mask_dpe = offs_dpe < Lk
-        off_qpe = (
-            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+        desc_qpe = tl.make_tensor_descriptor(
+            Q + cur_batch * num_q_heads * Lk,
+            shape=[q_head_num, Lk],
+            strides=[Lk, 1],
+            block_shape=[BLOCK_H, BLOCK_DPE],
         )
-        qpe = tl.load(
-            Q + off_qpe,
-            mask=(mask_h[:, None]) & (mask_dpe[None, :]),
-            other=0.0,
-            cache_modifier=".ca",
-        )
+        qpe = desc_qpe.load([cur_head_start, BLOCK_DMODEL])
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
@@ -340,10 +332,27 @@ def _fwd_grouped_kernel_stage1(
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
     if split_kv_end > split_kv_start:
-        base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
-        base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
+        # K descriptor: 2D view (kv_total_tokens, Lk) for cur_kv_head.
+        desc_k = tl.make_tensor_descriptor(
+            K_Buffer + cur_kv_head * Lk,
+            shape=[kv_total_tokens, Lk],
+            strides=[num_kv_heads * Lk, 1],
+            block_shape=[1, BLOCK_DMODEL],
+        )
         if BLOCK_DPE > 0:
-            base_offs_kpe = cur_kv_head * stride_buf_kh + offs_dpe[:, None]
+            desc_kpe = tl.make_tensor_descriptor(
+                K_Buffer + cur_kv_head * Lk + BLOCK_DMODEL,
+                shape=[kv_total_tokens, Lk - BLOCK_DMODEL],
+                strides=[num_kv_heads * Lk, 1],
+                block_shape=[1, BLOCK_DPE],
+            )
+        if not IS_MLA:
+            desc_v = tl.make_tensor_descriptor(
+                V_Buffer + cur_kv_head * Lv,
+                shape=[kv_total_tokens, Lv],
+                strides=[num_kv_heads * Lv, 1],
+                block_shape=[1, BLOCK_DV],
+            )
 
         ks = tl.load(k_scale)
         vs = tl.load(v_scale)
@@ -351,34 +360,22 @@ def _fwd_grouped_kernel_stage1(
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_page_number = tl.load(
                 Req_to_tokens
-                + stride_req_to_tokens_b * cur_batch_req_idx
+                + req_to_tokens_stride * cur_batch_req_idx
                 + offs_n // PAGE_SIZE,
                 mask=offs_n < split_kv_end,
                 other=0,
                 cache_modifier=".ca",
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            kv_loc = (kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE).to(tl.int32)
 
-            # explicitly facilitate overlapping load/compute
-            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-                cache_modifier=".cg",
-            )
+            # Gather K rows and transpose to (BLOCK_DMODEL, BLOCK_N) for dot.
+            k = tl.trans(desc_k.gather(kv_loc, 0))
 
             if k.dtype.is_fp8():
                 k = (k.to(tl.float32) * ks).to(q.dtype)
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
-                offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
-                    other=0.0,
-                    cache_modifier=".cg",
-                )
+                kpe = tl.trans(desc_kpe.gather(kv_loc, 0))
                 if kpe.dtype.is_fp8():
                     kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
@@ -392,12 +389,7 @@ def _fwd_grouped_kernel_stage1(
             )
 
             if not IS_MLA:
-                offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
-                v = tl.load(
-                    V_Buffer + offs_buf_v,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                    other=0.0,
-                )
+                v = desc_v.gather(kv_loc, 0)  # (BLOCK_N, BLOCK_DV)
                 if v.dtype.is_fp8():
                     v = (v.to(tl.float32) * vs).to(q.dtype)
             else:
@@ -415,10 +407,19 @@ def _fwd_grouped_kernel_stage1(
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
+        # Att_Out shape is (B, num_q_heads, NUM_KV_SPLITS, Lv + 1).
+        # Compute strides from dimensions (contiguous layout).
+        att_mid_os = Lv + 1
+        att_mid_oh = NUM_KV_SPLITS * att_mid_os
+        att_mid_ob = num_q_heads * att_mid_oh
+
+        offs_dv = tl.arange(0, BLOCK_DV)
+        mask_dv = offs_dv < Lv
+
         offs_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head[:, None] * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            cur_batch * att_mid_ob
+            + cur_head[:, None] * att_mid_oh
+            + split_kv_id * att_mid_os
             + offs_dv[None, :]
         )
 
@@ -429,9 +430,9 @@ def _fwd_grouped_kernel_stage1(
         )
 
         offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            cur_batch * att_mid_ob
+            + cur_head * att_mid_oh
+            + split_kv_id * att_mid_os
             + Lv
         )
 
@@ -479,7 +480,9 @@ def _decode_grouped_att_m_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     batch, head_num = q.shape[0], q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[-2]
+    num_kv_heads = k_buffer.shape[-2]
+    kv_group_num = q.shape[1] // num_kv_heads
+    kv_total_tokens = k_buffer.numel() // (num_kv_heads * Lk)
 
     BLOCK_H = 16
     NUM_KV_SPLITS = num_kv_splits
@@ -506,15 +509,9 @@ def _decode_grouped_att_m_fwd(
         B_Seqlen,
         att_out,
         Req_to_tokens.stride(0),
-        q.stride(0),
-        q.stride(1),
-        k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        att_out.stride(0),
-        att_out.stride(1),
-        att_out.stride(2),
+        head_num,
+        num_kv_heads,
+        kv_total_tokens,
         k_scale,
         v_scale,
         kv_group_num=kv_group_num,
@@ -542,12 +539,7 @@ def _fwd_kernel_stage2(
     o,
     lse,
     B_Seqlen,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
-    stride_obs,
-    stride_oh,
-    stride_lse_bs,
+    num_q_heads,
     NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -564,8 +556,14 @@ def _fwd_kernel_stage2(
     e_max = -float("inf")
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
-    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
-    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
+    # Mid_O shape is (B, num_q_heads, NUM_KV_SPLITS, Lv + 1).
+    # Compute strides from dimensions (contiguous layout).
+    mid_o_split_stride = Lv + 1
+    mid_o_head_stride = NUM_KV_SPLITS * mid_o_split_stride
+    mid_o_batch_stride = num_q_heads * mid_o_head_stride
+
+    offs_v = cur_batch * mid_o_batch_stride + cur_head * mid_o_head_stride + offs_d
+    offs_logic = cur_batch * mid_o_batch_stride + cur_head * mid_o_head_stride + Lv
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
         kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
@@ -574,9 +572,11 @@ def _fwd_kernel_stage2(
 
         if split_kv_end > split_kv_start:
             tv = tl.load(
-                Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
+                Mid_O + offs_v + split_kv_id * mid_o_split_stride,
+                mask=mask_d,
+                other=0.0,
             )
-            tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
+            tlogic = tl.load(Mid_O + offs_logic + split_kv_id * mid_o_split_stride)
             n_e_max = tl.maximum(tlogic, e_max)
 
             old_scale = tl.exp(e_max - n_e_max)
@@ -587,14 +587,19 @@ def _fwd_kernel_stage2(
             e_sum = e_sum * old_scale + exp_logic
             e_max = n_e_max
 
+    # o shape is (B, num_q_heads, Lv). Compute strides from dimensions.
+    o_head_stride = Lv
+    o_batch_stride = num_q_heads * o_head_stride
+
     tl.store(
-        o + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        o + cur_batch * o_batch_stride + cur_head * o_head_stride + offs_d,
         acc / e_sum,
         mask=mask_d,
     )
     lse_val = e_max + tl.log(e_sum)
+    # lse shape is (B, num_q_heads).
     tl.store(
-        lse + cur_batch * stride_lse_bs + cur_head,
+        lse + cur_batch * num_q_heads + cur_head,
         lse_val,
     )
 
@@ -626,12 +631,7 @@ def _decode_softmax_reducev_fwd(
         o,
         lse,
         b_seq_len,
-        logits.stride(0),
-        logits.stride(1),
-        logits.stride(2),
-        o.stride(0),
-        o.stride(1),
-        lse.stride(0),
+        head_num,
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
@@ -731,6 +731,9 @@ def decode_attention_fwd(
     is_mla=False,
 ):
     assert num_kv_splits == attn_logits.shape[2]
+
+    # TMA descriptors require a global memory allocator for descriptor storage.
+    set_triton_allocator(q.device)
 
     if k_scale is None:
         k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
